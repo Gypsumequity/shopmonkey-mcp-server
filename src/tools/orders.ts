@@ -1,20 +1,29 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { shopmonkeyRequest, sanitizePathParam, getDefaultLocationId } from '../client.js';
+import { fetchOrdersInWindow } from '../orderWindow.js';
 import type { Order } from '../types/shopmonkey.js';
 import type { ToolHandlerMap } from '../types/tools.js';
 import { pickFields } from '../types/tools.js';
 
+function jsonResult(payload: unknown): { content: { type: 'text'; text: string }[] } {
+  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
 export const definitions: Tool[] = [
   {
     name: 'list_orders',
-    description: 'List work orders from Shopmonkey. Filter by status, customer ID, date range, or location.',
+    description:
+      'List work orders from Shopmonkey. Give startDate/endDate to read a date window: the window is read directly when the API honours sorting, and falls back to scanning the full list when it does not. The result reports which happened (`strategy`) and how many requests it cost. Without dates this is a single unsorted page, which on this API is an arbitrary sample rather than the first N orders — prefer a date window whenever you want a complete answer.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         status: { type: 'string', enum: ['Estimate', 'RepairOrder', 'Invoice'], description: 'Filter by order status' },
         customerId: { type: 'string', description: 'Filter orders by customer ID' },
         locationId: { type: 'string', description: 'Filter by location ID (for multi-location shops). Defaults to SHOPMONKEY_LOCATION_ID env var if set.' },
-        limit: { type: 'number', description: 'Maximum number of results to return (default: 25)' },
+        startDate: { type: 'string', description: 'Start of the date window, ISO 8601 (e.g. "2026-11-02"). Inclusive.' },
+        endDate: { type: 'string', description: 'End of the date window, ISO 8601 (e.g. "2026-11-08"). Inclusive of the whole day.' },
+        dateField: { type: 'string', description: 'Which date the window applies to. Default "invoicedDate" (when revenue was booked). Use "createdDate" for when the order was opened.' },
+        limit: { type: 'number', description: 'Maximum number of results to return. Applies after the window is read.' },
         skip: { type: 'number', description: 'Number of records to skip for pagination (default: 0)' },
       },
     },
@@ -112,12 +121,45 @@ export const handlers: ToolHandlerMap = {
     if (args.status !== undefined) params.status = String(args.status);
     if (args.customerId !== undefined) params.customerId = String(args.customerId);
     if (args.locationId !== undefined) params.locationId = String(args.locationId);
-    if (args.limit !== undefined) params.limit = String(args.limit);
-    if (args.skip !== undefined) params.skip = String(args.skip);
     applyDefaultLocation(params);
 
-    const data = await shopmonkeyRequest<Order[]>('GET', '/order', undefined, params);
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    const startDate = args.startDate !== undefined ? String(args.startDate) : undefined;
+    const endDate = args.endDate !== undefined ? String(args.endDate) : undefined;
+
+    // No window asked for: keep the old single-page behaviour so existing
+    // callers are unaffected.
+    if (!startDate && !endDate) {
+      if (args.limit !== undefined) params.limit = String(args.limit);
+      if (args.skip !== undefined) params.skip = String(args.skip);
+      const data = await shopmonkeyRequest<Order[]>('GET', '/order', undefined, params);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+
+    const { records, truncated, strategy, requests, orderbyUsed } = await fetchOrdersInWindow(params, {
+      dateField: args.dateField !== undefined ? String(args.dateField) : 'invoicedDate',
+      startDate,
+      endDate,
+    });
+
+    // `status` is ignored server-side on this endpoint (see docs/LIMITATIONS.md),
+    // so a caller asking for Invoice can be handed Estimates. Enforce it here
+    // rather than letting that through.
+    const wanted = args.status !== undefined ? String(args.status) : undefined;
+    const matched = wanted ? records.filter((o) => String(o.status) === wanted) : records;
+
+    const skip = typeof args.skip === 'number' ? args.skip : 0;
+    const limit = typeof args.limit === 'number' ? args.limit : matched.length;
+
+    return jsonResult({
+      window: { startDate: startDate ?? null, endDate: endDate ?? null,
+                dateField: args.dateField !== undefined ? String(args.dateField) : 'invoicedDate' },
+      strategy,
+      requests,
+      ...(orderbyUsed ? { orderbyUsed } : {}),
+      matched: matched.length,
+      truncated,
+      orders: matched.slice(skip, skip + limit),
+    });
   },
 
   async get_order(args) {
