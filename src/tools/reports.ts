@@ -3,13 +3,15 @@
 // existing list endpoints. All tools return raw JSON (not Markdown) for
 // downstream processing flexibility.
 //
-// These reports cannot narrow the date range at the API: Shopmonkey's flat list
-// endpoints accept date params and ignore them. Order-based reports therefore
-// page the full order list and filter here, reporting `truncated` when the
-// safety cap is reached; the appointment report uses /appointment/search, whose
-// structured where filter does work server-side. See docs/LIMITATIONS.md.
+// Order-based reports read their date window through fetchOrdersInWindow,
+// which asks the API to sort and only pages the whole list when it refuses.
+// Each report says which happened (`strategy`) and what it cost (`requests`),
+// so a wrong-looking number can be traced to how it was gathered. The
+// appointment report uses /appointment/search, whose structured where filter
+// works server-side. See docs/LIMITATIONS.md and src/orderWindow.ts.
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { fetchAllRecords, shopmonkeyRequest, getDefaultLocationId, isWithinDateRange, toDateRangeBoundary } from '../client.js';
+import { shopmonkeyRequest, getDefaultLocationId, toDateRangeBoundary } from '../client.js';
+import { fetchOrdersInWindow } from '../orderWindow.js';
 import type { Order, Appointment } from '../types/shopmonkey.js';
 import type { ToolHandlerMap } from '../types/tools.js';
 
@@ -72,10 +74,12 @@ export const handlers: ToolHandlerMap = {
     // is not "orders created in August" — an order opened in July can be
     // invoiced in August. Orders never invoiced have no invoicedDate and are
     // correctly excluded from revenue.
-    const { records: allOrders, truncated } = await fetchAllRecords<Order>('/order', params);
-    const orders = allOrders.filter(o =>
-      isWithinDateRange(o.invoicedDate as string | undefined, String(args.startDate), String(args.endDate))
-    );
+    const { records: orders, truncated, strategy, requests, orderbyUsed } =
+      await fetchOrdersInWindow(params, {
+        dateField: 'invoicedDate',
+        startDate: String(args.startDate),
+        endDate: String(args.endDate),
+      });
 
     // Null-prototype: the keys come from Shopmonkey's own status field, and a
     // value of __proto__ or constructor would otherwise reach Object.prototype.
@@ -88,7 +92,18 @@ export const handlers: ToolHandlerMap = {
       const cost = Number(order.totalCostCents ?? 0);
 
       totalCostCents += cost;
-      if (order.paid) paidCostCents += cost;
+      // Not `if (order.paid) paidCostCents += cost`: that flag is all-or-
+      // nothing, so a part-paid ticket counted as zero and a settled one
+      // counted its full value. `paidCostCents` is the amount actually
+      // received, which is what a revenue report is asking for.
+      //
+      // The `paid` flag is still the fallback for records that carry no
+      // paidCostCents at all, so older or partial payloads do not silently
+      // report a shop as having collected nothing.
+      const received = order.paidCostCents;
+      paidCostCents += received === undefined || received === null
+        ? (order.paid ? cost : 0)
+        : Number(received);
 
       if (!breakdown[status]) breakdown[status] = { count: 0, totalCostCents: 0 };
       breakdown[status].count += 1;
@@ -104,7 +119,9 @@ export const handlers: ToolHandlerMap = {
       },
       breakdown,
       count: orders.length,
-      scannedOrders: allOrders.length,
+      strategy,
+      requests,
+      ...(orderbyUsed ? { orderbyUsed } : {}),
       truncated,
     };
 
@@ -161,7 +178,12 @@ export const handlers: ToolHandlerMap = {
     if (args.locationId !== undefined) params.locationId = String(args.locationId);
     params.status = 'Estimate';
 
-    const { records: orders, truncated } = await fetchAllRecords<Order>('/order', params);
+    // Open estimates have no natural date window, so this one still reads the
+    // whole list. It asks for a sort anyway: when the API honours it the read
+    // is at least stable between calls, which is why two runs an hour apart no
+    // longer disagree about how many estimates are open.
+    const { records: orders, truncated, strategy, requests } =
+      await fetchOrdersInWindow(params, { dateField: 'createdDate', maxRecords: 5000 });
 
     const now = new Date();
     const openEstimates = orders
@@ -181,6 +203,8 @@ export const handlers: ToolHandlerMap = {
       orders: openEstimates,
       count: openEstimates.length,
       oldestAgeInDays,
+      strategy,
+      requests,
       truncated,
     };
 
