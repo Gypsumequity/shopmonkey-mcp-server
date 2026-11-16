@@ -112,13 +112,43 @@ returns plausible, wrong data, which is what makes them worth writing down.
 **Found by:** [Andy Kimberle](https://github.com/AndyKimberle/shopmonkey-mcp-server), in production
 **Workaround, as implemented:**
 - Appointments use `POST /appointment/search`, whose structured `where.startDate.gte/.lte` filter **is** applied server-side. `list_appointments` routes through it automatically when given a date, and `report_appointment_summary` always uses it.
-- Orders have no equivalent search endpoint, so `report_revenue_summary` and `report_open_estimates` page the full list and filter client-side via `isWithinDateRange`.
+- Orders have no equivalent search endpoint. They instead go through
+  `fetchOrdersInWindow` (`src/orderWindow.ts`), which asks the list endpoint to
+  sort via `orderby` and reads only as far back as the window needs. See
+  *No stable sort* below for why that matters and what happens when `orderby`
+  is ignored.
 
 ### List endpoints return unstable result sets
 
 **Status:** Worked around
 **Applies to:** flat list endpoints generally; confirmed on `GET /appointment` and `GET /order`
 **Behaviour:** Identical requests seconds apart return different — sometimes non-overlapping — subsets of the same data. A record present in one response can be entirely absent from the next. There is no stable sort, so any single capped fetch samples an arbitrary window. On a shop with 2000+ orders this produced three different totals from three identical revenue queries.
+
+**Field measurement (BHI shop, ~900 invoices, Nov 2026).** Fifty-eight passes
+over `GET /order` returned 623 distinct records and then stopped yielding new
+ones — the sweep *converged on an incomplete set*. Records pulled live five days
+earlier proved invoices existed that none of those 58 passes returned. More
+passes do not help; this is not a cap that can be raised.
+
+**Mitigation — `orderby`.** The list endpoints document an `orderby` parameter
+alongside the `where` that they ignore. If `orderby` is honoured the list gains
+a stable order, `skip` becomes meaningful, and a date window can be read
+newest-first and stopped as soon as it pages past the start — two or three
+requests for a week instead of fifty-eight.
+
+Whether this shop's API honours it was unknown when the code was written, and
+guessing has burned this project before (see API-PROVENANCE.md), so
+`src/orderWindow.ts` **does not assume**. It tries the plausible encodings for
+`orderby` and checks each response's own values for monotonicity. A page only
+counts as sorted if it actually is. Every subsequent page is re-checked too,
+because an endpoint that changes its mind mid-read would otherwise produce a
+partial answer that looks complete — the single worst outcome. On any failure
+the read falls back to the old exhaustive sweep.
+
+Both order reports and `list_orders` now return `strategy` (`"sorted"` or
+`"swept"`), `requests`, and `orderbyUsed` when one worked. **A `strategy` of
+`"sorted"` means the window is trustworthy. A `strategy` of `"swept"` means the
+answer is a floor and should be reported as one.**
 **Found by:** [Andy Kimberle](https://github.com/AndyKimberle/shopmonkey-mcp-server), in production
 **Workaround, as implemented:** `fetchAllRecords` pages to exhaustion rather than taking one batch, de-duplicates by `id` (the same record can appear on two pages), and prefers the documented `meta.hasMore` signal to decide when to stop.
 
@@ -161,7 +191,7 @@ account to fix safely, since the correct request shape is unknown:
 | Tool | Behaviour |
 |---|---|
 | `search_customers` | The `query` argument is ignored; returns arbitrary records in id order. Returning *something* rather than an error is worse than failing — a caller can conclude a customer does not exist and create a duplicate. |
-| `list_orders` | The `status` filter is ignored; asking for `Invoice` can return `Estimate` records. |
+| `list_orders` | The `status` filter is ignored; asking for `Invoice` can return `Estimate` records. Since the windowed read, `list_orders` re-applies `status` client-side when given a date window, so a windowed call no longer leaks the wrong status. An unwindowed call still can. |
 
 ### Routes in use that the documentation does not list
 
