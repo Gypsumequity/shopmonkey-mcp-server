@@ -44,7 +44,7 @@ export const definitions: Tool[] = [
   },
   {
     name: 'report_open_estimates',
-    description: 'List all open (unauthorized) estimates, showing their age in days. Useful for follow-up on stale estimates. Pages the full estimate list each call; check the returned `truncated` flag if the shop is very large.',
+    description: 'List genuinely open estimates \u2014 unauthorized, never invoiced, and not archived \u2014 with the age in days of each. This is the follow-up list: quotes a customer has not acted on. Records the shop has already closed out, invoiced or archived are excluded, as are repair orders in progress. The result reports how many were excluded and why, under `excluded`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -185,9 +185,32 @@ export const handlers: ToolHandlerMap = {
     const { records: orders, truncated, strategy, requests } =
       await fetchOrdersInWindow(params, { dateField: 'createdDate', maxRecords: 5000 });
 
+    // What counts as an open estimate.
+    //
+    // `authorized === false` on its own is not the answer, though it reads like
+    // it. That flag stays false on plenty of records that are nothing to do with
+    // quoting, and against a live shop it returned 627 "open estimates" of which
+    // only 37 were open estimates:
+    //
+    //   - 278 were already INVOICED, 266 of them fully PAID. An order invoiced
+    //     without passing through an authorisation step never sets the flag, so
+    //     completed, settled work was being reported as outstanding quotes.
+    //   - 187 were RepairOrders in progress — active work, not quotes.
+    //   - 125 of the remainder were ARCHIVED: closed out by the shop. The shop
+    //     had already dealt with these, which is exactly why they were archived.
+    //
+    // So three conditions, not one. Each is a distinct way a record stops being
+    // an open estimate, and dropping any one of them inflates the count by
+    // enough to make the report useless: it was overstating the book by 17x and
+    // its value by roughly double.
     const now = new Date();
     const openEstimates = orders
-      .filter(o => o.authorized === false)
+      .filter(o =>
+        o.authorized === false &&
+        o.status === 'Estimate' &&   // not a RepairOrder or an Invoice
+        !o.invoicedDate &&           // never invoiced, belt to the status braces
+        o.archived !== true          // not closed out by the shop
+      )
       .map(o => {
         const created = o.createdDate ? new Date(String(o.createdDate)) : null;
         const ageInDays = created ? Math.floor((now.getTime() - created.getTime()) / (1000 * 60 * 60 * 24)) : null;
@@ -199,10 +222,22 @@ export const handlers: ToolHandlerMap = {
       return age > max ? age : max;
     }, 0);
 
+    // Say what was dropped. A reader who expects a bigger number deserves to see
+    // where it went rather than wonder whether the filter is eating real work.
+    const unauthorized = orders.filter(o => o.authorized === false);
+    const excluded = {
+      alreadyInvoiced: unauthorized.filter(o => o.status === 'Invoice' || !!o.invoicedDate).length,
+      repairOrdersInProgress: unauthorized.filter(o => o.status === 'RepairOrder').length,
+      archived: unauthorized.filter(
+        o => o.status === 'Estimate' && !o.invoicedDate && o.archived === true
+      ).length,
+    };
+
     const result = {
       orders: openEstimates,
       count: openEstimates.length,
       oldestAgeInDays,
+      excluded,
       strategy,
       requests,
       truncated,
