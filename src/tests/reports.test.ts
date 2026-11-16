@@ -104,8 +104,12 @@ describe('Reports — report_revenue_summary', () => {
 
     assert.equal(data.count, 1, 'only the in-range invoiced order counts');
     assert.equal(data.totals.totalCostCents, 10000);
-    assert.equal(data.scannedOrders, 4);
     assert.equal(data.truncated, false);
+    // `scannedOrders` is gone: with a windowed read the whole list is no
+    // longer scanned, so the number would have meant nothing. `strategy` and
+    // `requests` say how the window was gathered instead.
+    assert.ok(['sorted', 'swept'].includes(data.strategy));
+    assert.ok(typeof data.requests === 'number' && data.requests > 0);
   });
 
   it('includes an order invoiced on the final day of the range', async () => {
