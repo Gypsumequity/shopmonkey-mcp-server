@@ -57,12 +57,23 @@ type Probe = { encode: (f: string, d: 'asc' | 'desc') => string } | 'unsupported
 /** Cached probe result. `null` = not yet probed, 'unsupported' = orderby ignored. */
 let cachedProbe: Probe = null;
 
+// When the probe fails, remember that only briefly. A permanent cache means one
+// bad probe downgrades every later call for the life of the process, and a
+// long-lived server then keeps sweeping long after whatever caused it has
+// passed. Ten minutes is long enough to avoid re-probing on every call in a
+// burst, short enough that the server heals itself.
+const UNSUPPORTED_TTL_MS = 10 * 60 * 1000;
+let unsupportedUntil = 0;
+
 /** Test hook: forget what the probe learned. */
 export function resetOrderbyProbe(): void {
   cachedProbe = null;
+  unsupportedUntil = 0;
 }
 
 const PAGE_SIZE = 100;
+/** How far the probe will page past null values before giving up on a field. */
+const PROBE_MAX_SKIP = 500;
 
 function dateValue(record: Order, field: string): number {
   const raw = (record as Record<string, unknown>)[field];
@@ -81,25 +92,41 @@ function dateValue(record: Order, field: string): number {
  * fewer than two comparable values proves nothing, so it is not treated as
  * evidence of sorting.
  */
-export function isPageSorted(page: Order[], field: string, dir: 'asc' | 'desc'): boolean {
+export type Sortedness = 'sorted' | 'unsorted' | 'inconclusive';
+
+export function checkPageSorted(page: Order[], field: string, dir: 'asc' | 'desc'): Sortedness {
   const values: number[] = [];
   for (const record of page) {
     const v = dateValue(record, field);
     if (!Number.isNaN(v)) values.push(v);
   }
-  if (values.length < 2) return false;
+  // Fewer than two comparable values proves nothing either way. This is not a
+  // hypothetical: sorting on invoicedDate descending puts every never-invoiced
+  // order at one end, and once a shop has more than a page of those, the first
+  // page is all nulls. Reading that as "the API ignored orderby" is how a
+  // working sorted read silently became a sweep in production.
+  if (values.length < 2) return 'inconclusive';
 
   for (let i = 1; i < values.length; i++) {
-    if (dir === 'desc' ? values[i] > values[i - 1] : values[i] < values[i - 1]) return false;
+    if (dir === 'desc' ? values[i] > values[i - 1] : values[i] < values[i - 1]) return 'unsorted';
   }
-  return true;
+  return 'sorted';
+}
+
+/** Back-compat shim: true only when a page is positively sorted. */
+export function isPageSorted(page: Order[], field: string, dir: 'asc' | 'desc'): boolean {
+  return checkPageSorted(page, field, dir) === 'sorted';
 }
 
 export interface WindowedResult extends FetchAllResult<Order> {
   /**
    * How the records were obtained:
-   *   'sorted' — `orderby` was honoured; the window was read directly.
+   *   'sorted' — `orderby` was honoured; the window was read directly and
+   *              `truncated: false` means what it says: this is every record.
    *   'swept'  — `orderby` was ignored; fell back to paging the whole list.
+   *              `truncated` is ALWAYS true here, because a sweep of an
+   *              unsorted endpoint cannot establish that it saw everything.
+   *              Treat the numbers as a floor and say so to whoever reads them.
    */
   strategy: 'sorted' | 'swept';
   /** Requests spent. Worth watching: 'swept' on a large shop is dozens. */
@@ -131,6 +158,9 @@ export async function fetchOrdersInWindow(
 
   let requests = 0;
 
+  // An expired 'unsupported' verdict goes back to being no verdict at all.
+  if (cachedProbe === 'unsupported' && Date.now() >= unsupportedUntil) cachedProbe = null;
+
   const encodingsToTry =
     cachedProbe === 'unsupported'
       ? []
@@ -157,7 +187,30 @@ export async function fetchOrdersInWindow(
       continue;
     }
 
-    if (!isPageSorted(firstPage, dateField, 'desc')) continue;
+    let verdict = checkPageSorted(firstPage, dateField, 'desc');
+
+    // An inconclusive first page means "look further", not "give up". Page past
+    // the nulls until the records start carrying the field, up to a bounded
+    // number of probes so a shop that is all nulls cannot stall here.
+    let probeSkip = 0;
+    let probePage = firstPage;
+    while (verdict === 'inconclusive' && probeSkip < PROBE_MAX_SKIP && probePage.length === PAGE_SIZE) {
+      probeSkip += PAGE_SIZE;
+      try {
+        const { data } = await shopmonkeyRequestWithMeta<Order[]>('GET', '/order', undefined, {
+          ...params, orderby, limit: String(PAGE_SIZE), skip: String(probeSkip),
+        });
+        requests++;
+        probePage = Array.isArray(data) ? data : [];
+      } catch {
+        requests++;
+        break;
+      }
+      if (probePage.length === 0) break;
+      verdict = checkPageSorted(probePage, dateField, 'desc');
+    }
+
+    if (verdict !== 'sorted') continue;
 
     cachedProbe = { encode };
     try {
@@ -171,6 +224,7 @@ export async function fetchOrdersInWindow(
       // discard it, stop trusting orderby for this process, and sweep instead.
       if (!(error instanceof OrderbyBetrayedError)) throw error;
       cachedProbe = 'unsupported';
+      unsupportedUntil = Date.now() + UNSUPPORTED_TTL_MS;
       break;
     }
   }
@@ -178,15 +232,30 @@ export async function fetchOrdersInWindow(
   // Nothing sorted the list. Remember that so later calls skip the probe, and
   // fall back to the behaviour that was there before — slow, but correct as far
   // as it reaches, and honest about truncation.
-  if (cachedProbe === null) cachedProbe = 'unsupported';
+  if (cachedProbe === null) {
+    cachedProbe = 'unsupported';
+    unsupportedUntil = Date.now() + UNSUPPORTED_TTL_MS;
+  }
 
-  const { records, truncated } = await fetchAllRecords<Order>('/order', params, { maxRecords });
+  const { records } = await fetchAllRecords<Order>('/order', params, { maxRecords });
   const filtered = records.filter((o) =>
     isWithinDateRange((o as Record<string, unknown>)[dateField] as string | undefined, startDate, endDate)
   );
   return {
     records: filtered,
-    truncated,
+    // Always true on this path, whatever fetchAllRecords thought.
+    //
+    // The sweep runs until the endpoint stops yielding, and on an endpoint with
+    // no stable sort that is not the same as having seen everything: it
+    // converges on an arbitrary subset and then goes quiet. Measured against
+    // this shop, 58 passes settled on 623 of ~900 records and stopped finding
+    // more, while records pulled days earlier proved the rest existed.
+    //
+    // Reporting truncated:false there is worse than reporting nothing. It is a
+    // claim of completeness that the method cannot support, and it is precisely
+    // the failure this module exists to prevent — a partial answer that looks
+    // whole. A swept answer is a floor. Say so.
+    truncated: true,
     strategy: 'swept',
     requests: requests + Math.ceil(records.length / PAGE_SIZE),
   };
